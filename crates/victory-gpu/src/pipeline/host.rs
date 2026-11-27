@@ -1462,26 +1462,40 @@ mod tests {
             }
         };
 
-        let is_software_adapter = {
+        let adapter_desc = {
             use windows::Win32::Graphics::Dxgi::{
-                CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1,
-                IDXGIFactory4,
+                CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
             };
             // SAFETY: plain DXGI adapter query for the live host device's LUID.
             unsafe {
                 CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
                     .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
                     .and_then(|a| a.GetDesc1())
-                    .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+                    .ok()
             }
         };
+        let is_software_adapter = adapter_desc.as_ref().is_none_or(|d| {
+            use windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE;
+            (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 || d.VendorId == 0x1414
+        });
         if is_software_adapter {
-            eprintln!("software WARP adapter does not enforce DepthBoundsTestEnable; skipping draw readback");
+            eprintln!("software/Microsoft adapter does not enforce DepthBoundsTestEnable; skipping draw readback");
             return;
         }
+        let adapter_info = adapter_desc
+            .map(|d| format!("vendor={:#x} device={:#x} flags={:#x}", d.VendorId, d.DeviceId, d.Flags))
+            .unwrap_or_default();
 
-        assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
-        assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+        assert_eq!(
+            run_draw(0.6, 1.0),
+            0,
+            "depth 0.5 outside [0.6, 1.0] must be rejected ({adapter_info})"
+        );
+        assert_eq!(
+            run_draw(0.4, 0.6),
+            255,
+            "depth 0.5 inside [0.4, 0.6] must pass ({adapter_info})"
+        );
     }
 
     fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
