@@ -123,6 +123,14 @@ impl DynamicBits {
         Self { words: vec![0u64; len.div_ceil(64)], len }
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn get(&self, idx: usize) -> Option<bool> {
+        if idx >= self.len {
+            return None;
+        }
+        Some((self.words[idx >> 6] >> (idx & 63)) & 1 != 0)
+    }
+
     fn find_run_in(&self, start: usize, end: usize, n: usize) -> Option<usize> {
         if n == 0 || start >= end || end - start < n {
             return None;
