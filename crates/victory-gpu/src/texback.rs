@@ -19,8 +19,9 @@
 //! what the list's last write left; a title read in between sees the frame
 //! before, as it would before the console's GPU has run.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -66,12 +67,12 @@ struct Ticket {
     valid: AtomicBool,
 }
 
-static TICKETS: Mutex<Vec<Weak<Ticket>>> = Mutex::new(Vec::new());
+static TICKETS: RwLock<Vec<Weak<Ticket>>> = RwLock::new(Vec::new());
 static TRACKING: AtomicBool = AtomicBool::new(false);
 
 fn track(owner: usize, at: usize, end: usize) -> Arc<Ticket> {
     let ticket = Arc::new(Ticket { owner, at, end, valid: AtomicBool::new(true) });
-    let mut tickets = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tickets = TICKETS.write().unwrap_or_else(|e| e.into_inner());
     tickets.retain(|weak| weak.strong_count() != 0);
     tickets.push(Arc::downgrade(&ticket));
     TRACKING.store(true, Ordering::Relaxed);
@@ -82,7 +83,7 @@ fn invalidate(matches: impl Fn(&Ticket) -> bool) {
     if !TRACKING.load(Ordering::Relaxed) {
         return;
     }
-    TICKETS.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| {
+    TICKETS.write().unwrap_or_else(|e| e.into_inner()).retain(|weak| {
         let Some(ticket) = weak.upgrade() else { return false };
         if matches(&ticket) {
             ticket.valid.store(false, Ordering::Release);
@@ -197,12 +198,51 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
     Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
+thread_local! {
+    static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Lands a batch of texture readbacks from a completed list, deduplicating
+/// repeated writes to the same title range (keeping only the latest) and
+/// running multi-texture tiling in parallel across worker threads.
+pub(crate) fn land_many(backs: &[Back]) {
+    if backs.is_empty() {
+        return;
+    }
+    if backs.len() == 1 {
+        land(&backs[0]);
+        return;
+    }
+    // Keep only the last readback for each distinct (at, end) range in the list.
+    let mut keep: Vec<usize> = Vec::with_capacity(backs.len());
+    for (idx, back) in backs.iter().enumerate().rev() {
+        let range = back.range();
+        if !keep.iter().any(|&k| backs[k].range() == range) {
+            keep.push(idx);
+        }
+    }
+    keep.reverse();
+    if keep.len() == 1 {
+        land(&backs[keep[0]]);
+        return;
+    }
+    // SAFETY: each worker indexes a distinct `Back` with its own D3D12 readback
+    // buffer and non-overlapping `(at, end)` range; D3D12 Map/Unmap on distinct
+    // resources is free-threaded.
+    struct SyncSlice<'a>(&'a [Back]);
+    unsafe impl Sync for SyncSlice<'_> {}
+    let slice = SyncSlice(backs);
+    crate::land::each_under(keep.len(), &|i| {
+        land(&slice.0[keep[i]]);
+    });
+}
+
 /// Once the list has run, tile its texels back into the same title allocation.
 pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     let _mapping = crate::watch::title_memory_reading();
-    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    let _ticket_guard = TICKETS.read().unwrap_or_else(|e| e.into_inner());
     if !back.ticket.valid.load(Ordering::Acquire) {
         let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
         if skipped.is_power_of_two() {
@@ -212,40 +252,46 @@ pub(crate) fn land(back: &Back) {
     }
     let (at, end) = back.range();
     let size = end - at;
-    let mut tiled = vec![0u8; size];
-    // Keep title bytes the subresources do not cover.
-    if !crate::host::read_into(at as *const u8, &mut tiled) {
-        return;
-    }
-    let mut data = std::ptr::null_mut();
-    // SAFETY: our read-back buffer, written by the list that has run.
-    unsafe {
-        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+    SCRATCH.with(|cell| {
+        let mut tiled = cell.borrow_mut();
+        if tiled.len() < size {
+            tiled.resize(size, 0);
+        }
+        let buf = &mut tiled[..size];
+        // Keep title bytes the subresources do not cover.
+        if !crate::host::read_into(at as *const u8, buf) {
             return;
         }
-    }
-    for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
-        let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
-        let f = footprint.Footprint;
-        let pitch = f.RowPitch as usize;
-        let len = pitch * rows as usize * f.Depth as usize;
-        // SAFETY: the subresource's part of the mapped buffer.
-        let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
-        if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
-            // SAFETY: mapped above.
-            unsafe { back.buffer.Unmap(0, None) };
-            return;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: our read-back buffer, written by the list that has run.
+        unsafe {
+            if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+                return;
+            }
         }
-    }
-    // SAFETY: mapped above.
-    unsafe { back.buffer.Unmap(0, None) };
-    crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
-    let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
-    if copied == 1 || copied.is_multiple_of(128) {
-        tracing::info!(copied, bytes = size, "texture readback landed");
-    }
+        for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
+            let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
+            let f = footprint.Footprint;
+            let pitch = f.RowPitch as usize;
+            let len = pitch * rows as usize * f.Depth as usize;
+            // SAFETY: the subresource's part of the mapped buffer.
+            let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
+            if let Err(e) = back.layout.tile(buf, mip, slice, linear, pitch, pitch * rows as usize) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+                // SAFETY: mapped above.
+                unsafe { back.buffer.Unmap(0, None) };
+                return;
+            }
+        }
+        // SAFETY: mapped above.
+        unsafe { back.buffer.Unmap(0, None) };
+        crate::host::copy_mapped(at as *mut u8, buf.as_ptr(), size, true);
+        let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+        if copied == 1 || copied.is_multiple_of(128) {
+            tracing::info!(copied, bytes = size, "texture readback landed");
+        }
+    });
 }
 
 

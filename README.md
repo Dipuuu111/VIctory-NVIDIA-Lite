@@ -1,3 +1,55 @@
+# VIctory-NVIDIA-Lite
+
+A low-RAM / 8 GB VRAM optimization fork of **VIctory-NVIDIA**, focused on
+running the latest flagship Xbox Series X|S titles cleanly on 16 GB RAM /
+8 GB VRAM Windows PCs and laptops at native 1080p.
+
+### Key Optimizations in This Fork
+
+- **VRAM & Texture Streaming (`resource.rs`, `pool.rs`, `draw.rs`):**
+  - Fixed `targets_kept()` render-target VRAM reserve settling on Xbox Series S
+    1080p (~1.3 GiB render targets), unlocking ~1.7 GB of previously locked VRAM
+    and cutting first-time bindless texture upload latency from ~55 frames to
+    under 1 frame.
+  - Reduced texture/staging pool block size (`64 MiB -> 32 MiB`) and capped
+    idle VRAM/staging pools (`SPARE_KEPT`, `STAGING_KEPT`) for 8 GB GPUs and
+    16 GB hosts.
+  - Tightened `VICTORY_TEXTURE_DROP_MIPS` (`drop_for`) to power-of-two 3D
+    streaming textures (`>= 1024x1024`, `>= 8` mips), keeping 1080p loading
+    cards and 2D UI artwork crisp.
+  - Fixed `Role::Miss` half-resolution `R32_FLOAT` depth matching for the
+    specular reflection stand-in.
+  - Trimmed redundant static-texture fingerprint rechecks (`RECHECK_FRAMES`)
+    to cut texture-pass CPU time and queue lock contention.
+- **Host RAM Footprint (`pipeline/known.rs`, `host/send.rs`, `shadow.rs`):**
+  - Memory-mapped `known-shaders.bin` read-only (`MapViewOfFile`) so raw
+    shader containers consume zero private heap RAM.
+  - Capped `host/send.rs` spare upload buffer cache to 128 MiB (down from
+    768 MiB) on `<= 32 GiB` hosts and wired `VICTORY_SNAPSHOT_POOL_MB` into
+    `shadow::give_back`.
+- **CPU Frame-Time & Threading (`shadow.rs`, `watch.rs`, `host.rs`, `host/card_steps.rs`, `texback.rs`, `descriptor/host.rs`, `draw.rs`):**
+  - Added `BufferSweep` per-part cached spans, packed `DynamicBits` descriptor
+    allocator bitset, binary-search `Journal::order_ahead`, and parallel
+    `texback::land_many`.
+  - Batched `JOURNAL` `RwLock` acquisitions per 64-item refresh chunk, merged
+    `Shadow::copied` + `ranged` + O(1) `unseen` tracking into `CopiedState` with
+    an O(dirty pages) `copy_stale` fast path, and released `copied` before
+    copying.
+  - Eliminated per-fill mutex locks, linear scans, and heap allocations in
+    `host/card_steps.rs`, deduplicated failed `GetWriteWatch` queries in
+    `watch.rs::ask_rest`, and enabled Thin LTO in release builds.
+
+### Credits & Acknowledgements
+
+- **VIctory** and **XCL** — core Xbox compatibility layer and original project.
+- **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)** — upstream NVIDIA fork this repository is based on.
+- **[XaviFortes/VIctory-RDNA](https://github.com/XaviFortes/VIctory-RDNA)** — inspiration for `BufferSweep` cached spans, `DynamicBits`, parallel `texback::land_many`, and `Journal::order_ahead`.
+- **Dark-Victory** and other community forks — low-RAM/VRAM tuning concepts.
+
+This repository contains no game files, shaders, or copyrighted assets.
+
+---
+
 # VIctory on NVIDIA
 
 ## Quick start: how to run it

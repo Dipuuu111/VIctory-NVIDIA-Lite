@@ -120,7 +120,13 @@ static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    if on_card() {
+        256 << 20
+    } else if crate::residency::limited_host_ram() {
+        128 << 20
+    } else {
+        768 << 20
+    }
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through

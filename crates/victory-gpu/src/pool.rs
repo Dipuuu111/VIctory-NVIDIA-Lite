@@ -26,15 +26,17 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
 /// Bytes of a block; pieces of more than half of one are not pooled (with
-/// blocks made ahead, [`ahead`]: of more than one).
-const BLOCK: u64 = 64 << 20;
+/// blocks made ahead, [`ahead`]: of more than one). 32 MiB halves internal
+/// fragmentation vs 64 MiB blocks on 8 GB GPUs / 16 GB RAM hosts.
+const BLOCK: u64 = 32 << 20;
 /// Blocks with nothing in them that are kept.
-const SPARE: usize = 2;
-/// The same while the card has room ([`room`]): 4 GiB of them.
-const SPARE_KEPT: usize = 64;
-/// The same of blocks of staging buffers, which are the PC's memory: run
-/// crash-1 held 5.2 GB of them.
-const STAGING_KEPT: usize = 8;
+const SPARE: usize = 1;
+/// The same while the card has room ([`room`]): capped to 192 MiB (6x 32 MiB)
+/// so empty texture blocks don't starve 8 GB GPUs.
+const SPARE_KEPT: usize = 6;
+/// The same of blocks of staging buffers, which are the PC's memory: capped
+/// to 96 MiB (3x 32 MiB) so idle upload blocks don't bloat RAM on 16 GB hosts.
+const STAGING_KEPT: usize = 3;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
@@ -57,7 +59,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         } else if pressure {
             1
         } else {
-            limit
+            limit.min(STAGING_KEPT)
         };
         pool.reclaim(tick, staging_limit, true);
     }

@@ -4005,9 +4005,7 @@ pub(crate) fn walls_trace() -> bool {
 fn read_backs(list: &HostList) {
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
-    for back in &list.deferred().texture_backs {
-        crate::texback::land(back);
-    }
+    crate::texback::land_many(&list.deferred().texture_backs);
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -8558,16 +8556,45 @@ impl Batch {
         let _flush = crate::timeline::span("refreshes of copies");
         let started = std::time::Instant::now();
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
-        // Those known to copy nothing are said so here, unless they are very
-        // many: then beside the others.
+        // Filter out already-unchanged spans before `ask_ahead` (chunked across
+        // worker threads when large) so we do not query the kernel write watch
+        // or dispatch worker-pool slots for the ~93% of spans known to copy nothing.
         const FEW: usize = 256;
-        let mut spans = spans;
-        let many = spans.len() > FEW;
-        if !many {
-            let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
-            FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
-        }
+        let all = spans.len();
+        let spans = if all > FEW {
+            const CHUNK: usize = 64;
+            let spans_arc = std::sync::Arc::new(spans);
+            let keep: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>> = std::sync::Arc::new(
+                (0..all).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
+            );
+            let s_ref = spans_arc.clone();
+            let k_ref = keep.clone();
+            crate::shadow::wide_each(all.div_ceil(CHUNK), move |c| {
+                let start = c * CHUNK;
+                let end = (start + CHUNK).min(s_ref.len());
+                let j = crate::watch::journal_read();
+                for i in start..end {
+                    let (shadow, from, to) = &s_ref[i];
+                    if !shadow.nothing_new_in(*from, *to - *from, &j) {
+                        k_ref[i].store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+            let mut v = std::sync::Arc::try_unwrap(spans_arc).unwrap_or_else(|a| (*a).clone());
+            let mut idx = 0usize;
+            v.retain(|_| {
+                let k = keep[idx].load(Ordering::Relaxed);
+                idx += 1;
+                k
+            });
+            v
+        } else {
+            let mut v = spans;
+            let j = crate::watch::journal_read();
+            v.retain(|(shadow, from, to)| !shadow.nothing_new_in(*from, *to - *from, &j));
+            v
+        };
+        FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         let ahead = spans.len() > 1;
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
@@ -8581,10 +8608,6 @@ impl Batch {
                 return;
             };
             let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
-            }
             Self::update(shadow, *from, *to);
         });
         if ahead {
@@ -8705,10 +8728,40 @@ impl Batch {
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
         let light = crate::watch::light();
-        if light && self.refreshes.len() <= FEW {
+        if light && !self.refreshes.is_empty() {
             let started = std::time::Instant::now();
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            if all <= FEW {
+                let j = crate::watch::journal_read();
+                self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new_in(*from, *to - *from, &j));
+            } else {
+                const CHUNK: usize = 64;
+                let refreshes_arc = std::sync::Arc::new(std::mem::take(&mut self.refreshes));
+                let keep: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>> = std::sync::Arc::new(
+                    (0..all).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
+                );
+                let r_ref = refreshes_arc.clone();
+                let k_ref = keep.clone();
+                crate::shadow::wide_each(all.div_ceil(CHUNK), move |c| {
+                    let start = c * CHUNK;
+                    let end = (start + CHUNK).min(r_ref.len());
+                    let j = crate::watch::journal_read();
+                    for i in start..end {
+                        let (shadow, from, to) = &r_ref[i];
+                        if !shadow.nothing_new_in(*from, *to - *from, &j) {
+                            k_ref[i].store(true, Ordering::Relaxed);
+                        }
+                    }
+                });
+                let mut v = std::sync::Arc::try_unwrap(refreshes_arc).unwrap_or_else(|a| (*a).clone());
+                let mut idx = 0usize;
+                v.retain(|_| {
+                    let k = keep[idx].load(Ordering::Relaxed);
+                    idx += 1;
+                    k
+                });
+                self.refreshes = v;
+            }
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
@@ -8738,10 +8791,6 @@ impl Batch {
                 let refreshes = std::mem::take(&mut self.refreshes);
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
                     Self::update(shadow, *from, *to);
                 });
             } else {

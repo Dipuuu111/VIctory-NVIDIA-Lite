@@ -97,7 +97,7 @@ fn holds() -> bool {
 
 /// A whole file mapped into memory: read-only (the library's file) or
 /// writable (the file a save fills). Unmapped when dropped.
-struct Mapped {
+pub(super) struct Mapped {
     at: windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
     /// The file, for a mapping made by [`Mapped::open`] ([`holds`]): open
@@ -147,7 +147,7 @@ impl Mapped {
 
     /// As [`Mapped::open`]; `hold` says whether the file stays open with
     /// the mapping.
-    fn open_holding(path: &std::path::Path, hold: bool) -> Option<Mapped> {
+    pub(super) fn open_holding(path: &std::path::Path, hold: bool) -> Option<Mapped> {
         // Opened as the standard library opens a file to read: others may
         // read, write, rename and delete it meanwhile, so a save still
         // renames the new library over this one.
@@ -174,7 +174,7 @@ impl Mapped {
         Mapped::map(&file, len, true)
     }
 
-    fn bytes(&self) -> &[u8] {
+    pub(super) fn bytes(&self) -> &[u8] {
         // SAFETY: the view holds `len` readable bytes until dropped.
         unsafe { std::slice::from_raw_parts(self.at.Value.cast(), self.len) }
     }

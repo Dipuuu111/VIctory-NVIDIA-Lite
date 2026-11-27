@@ -1374,6 +1374,44 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     base
 }
 
+/// How many of the largest levels the host copy of a placed texture
+/// described by `desc` leaves out for good (`VICTORY_TEXTURE_DROP_MIPS=N`,
+/// 1 to 4; off by default). Adapted from soldsawn/victory-nvidia-8gb & Rota.
+#[cfg(windows)]
+fn drop_levels(desc: &ResourceDesc) -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let n = *N.get_or_init(|| {
+        let n = std::env::var("VICTORY_TEXTURE_DROP_MIPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(4);
+        if n > 0 {
+            tracing::info!(levels = n, "VICTORY_TEXTURE_DROP_MIPS: placed textures leave out their largest levels");
+        }
+        n
+    });
+    if n == 0 || !held_only() {
+        return 0;
+    }
+    // Never drop mips on non-2D, array/cubemap (depth_or_array_size > 1),
+    // or render-target/depth/UAV textures (flags bits 0..2).
+    if desc.dimension != 3 || desc.depth_or_array_size != 1 || (desc.flags & 0x7) != 0 {
+        return 0;
+    }
+    drop_for(n, desc.width, u64::from(desc.height), u32::from(desc.mip_levels))
+}
+
+#[cfg(any(windows, test))]
+fn drop_for(n: u32, width: u64, height: u64, mips: u32) -> u32 {
+    // Only drop top mips on large power-of-two streaming 3D world textures (>=1024px, >=8 mips),
+    // leaving 1920x1080 full-screen loading cards, 2D UI, and smaller character/probe maps untouched.
+    if n == 0 || mips < 8 || width.min(height) < 1024 || !width.is_power_of_two() || !height.is_power_of_two() {
+        return 0;
+    }
+    n.min(mips - 1)
+}
+
 /// The bytes of title memory a placed texture with the resource description
 /// `desc` is read from for a view that starts at level `first`; `None` as
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
@@ -1432,6 +1470,10 @@ pub(crate) fn want_level(this: This, first: u32) {
         return;
     };
     if host.base == 0 || host.base <= base_level(&r.desc, first) {
+        return;
+    }
+    let drop = drop_levels(&r.desc);
+    if drop > 0 && host.base <= base_level(&r.desc, first.max(drop)) && alias_of(this).is_none() {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1708,9 +1750,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
-            }
+            let drop = drop_levels(&r.desc);
+            let first = if first == u32::MAX { drop } else { first.max(drop) };
+            base = base_level(&r.desc, first);
         }
         let texture = match texture {
             Some(texture) => Some(texture),
@@ -1905,11 +1947,15 @@ fn targets_seen(last: u64, since: u64, targets: u64, now: u64) -> (u64, u64) {
 }
 
 /// What [`targets_room_kept`] keeps of `most`: what the targets do not
-/// hold yet, or nothing once they hold half of it or more and have not
-/// grown for `settle` ms (`still_ms`; `settle` 0: always kept).
+/// hold yet, or nothing once they hold enough of the world's targets
+/// (`(most / 3).min(1024 MiB)`, so both Series S 1080p at ~1.3 GiB and
+/// Series X 1440p/4K settle once loaded, while pre-world menus at ~650 MiB
+/// still keep the full reserve) and have not grown for `settle` ms
+/// (`still_ms`; `settle` 0: always kept).
 #[cfg(any(windows, test))]
 fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64) -> u64 {
-    if settle > 0 && targets >= most / 2 && still_ms >= settle {
+    let floor = (most / 3).min(1024 << 20);
+    if settle > 0 && targets >= floor && still_ms >= settle {
         0
     } else {
         most.saturating_sub(targets)
@@ -4834,8 +4880,9 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(targets_kept(most, 652 * MIB, 60_000, 20_000), 2420 * MIB);
         // The world's first frames: still growing.
         assert_eq!(targets_kept(most, 2083 * MIB, 5_000, 20_000), 989 * MIB);
-        // Settled: nothing kept.
+        // Settled: nothing kept (Series X 1440p/4K and Series S 1080p ~1.3 GiB).
         assert_eq!(targets_kept(most, 2432 * MIB, 20_000, 20_000), 0);
+        assert_eq!(targets_kept(most, 1340 * MIB, 20_000, 20_000), 0);
         // `VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS=0`: kept as before.
         assert_eq!(targets_kept(most, 2432 * MIB, 600_000, 0), 640 * MIB);
 

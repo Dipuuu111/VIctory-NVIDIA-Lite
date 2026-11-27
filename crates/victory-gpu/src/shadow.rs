@@ -40,19 +40,15 @@ pub(crate) struct Shadow {
     /// Where the title buffer starts and how long it is.
     start: u64,
     len: u64,
-    /// Per page of title memory from `start`'s on: the write-watch asking
-    /// after which it was last copied (0: never).
-    copied: Mutex<Vec<u64>>,
-    /// Two ranges of title memory taken whole, the last one and the longest,
-    /// and the asking after which each was ([`Shadow::copy_stale`]). A page
-    /// a range holds in part cannot say so in `copied`. Locked inside
-    /// `copied`'s lock.
-    ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// Per-page copy timestamps, unseen-page count, and whole-range records
+    /// combined under a single lock to avoid double-locking on every refresh.
+    copied: Mutex<CopiedState>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    has_pending: std::sync::atomic::AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -105,6 +101,59 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+}
+
+/// Per-page copy state for a [`Shadow`], combining page timestamps, the
+/// remaining count of never-copied pages (`unseen`), and the two whole-range
+/// records under one mutex.
+struct CopiedState {
+    pages: Vec<u64>,
+    unseen: usize,
+    ranged: [(usize, usize, u64); 2],
+}
+
+impl CopiedState {
+    fn new(pages: usize) -> Self {
+        Self {
+            pages: vec![0; pages],
+            unseen: pages,
+            ranged: [(0, 0, 0); 2],
+        }
+    }
+
+    #[inline]
+    fn set(&mut self, index: usize, now: u64) {
+        if let Some(at) = self.pages.get_mut(index) {
+            if *at == 0 && now != 0 {
+                self.unseen = self.unseen.saturating_sub(1);
+            }
+            *at = now;
+        }
+    }
+
+    #[inline]
+    fn max_set(&mut self, index: usize, now: u64) {
+        if let Some(at) = self.pages.get_mut(index) {
+            let next = (*at).max(now);
+            if *at == 0 && next != 0 {
+                self.unseen = self.unseen.saturating_sub(1);
+            }
+            *at = next;
+        }
+    }
+
+    #[inline]
+    fn ranged_for(&self, from: usize, to: usize) -> u64 {
+        self.ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
+    }
+
+    #[inline]
+    fn note_ranged(&mut self, from: usize, to: usize, now: u64) {
+        self.ranged[0] = (from, to, now);
+        if to - from >= self.ranged[1].1 - self.ranged[1].0 {
+            self.ranged[1] = (from, to, now);
+        }
+    }
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -176,7 +225,7 @@ pub(crate) fn cards() -> bool {
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
 /// - Unknown (`None`, e.g. WARP): `(16, 512)` MiB.
-/// - `<= 12 GiB` (8–12 GB cards, whose WDDM budget is below 12 GiB): 16 MiB,
+/// - `<= 12 GiB` (8ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“12 GB cards, whose WDDM budget is below 12 GiB): 16 MiB,
 ///   and 18% of the budget between 512 and 2048 MiB. At 512 an RTX 4070
 ///   SUPER (budget 11,229 MB) kept 592 MB of copies on the card and 5.7 GB in
 ///   the PC's memory, which its shaders read over the bus: the opening
@@ -186,8 +235,8 @@ pub(crate) fn cards() -> bool {
 ///   27-44 ms a frame, and the release build ran gameplay at 21-25 fps
 ///   (2026-11-26, logs coolfox-20261126-134258 / -140021 / -140546).
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
-///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
-/// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
+///   ~13.5ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“15.2 GiB): `(4, 2048)` MiB.
+/// - `>= 20 GiB` (24ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
 ///   capping at 25% of local budget (at most 8 GiB) so "before" twins (up to 2x)
 ///   still leave headroom for textures and render targets.
 fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
@@ -730,7 +779,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
             continue;
         };
         let written: std::collections::HashMap<usize, u64> = written.into_iter().collect();
-        let copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner()).pages.clone();
         for (i, &at) in copied.iter().enumerate() {
             let page = start / PAGE + i;
             if at == 0 || written.get(&page).is_some_and(|&w| w > at) {
@@ -766,7 +815,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 /// many.
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     let bytes: usize = copies.iter().map(|c| c.2).sum();
-    if bytes > 4 << 20 {
+    if bytes > 512 << 10 {
         wide(copy_jobs(copies));
         return;
     }
@@ -1354,15 +1403,26 @@ fn snapshots_kept() -> usize {
 /// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
 /// the largest, and of those the largest one and the next ones up to `KEPT`
 /// bytes in all.
+fn snapshots_kept_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|mb| mb << 20)
+            .unwrap_or(512 << 20)
+    })
+}
+
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let kept_bytes = snapshots_kept_bytes();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if kept > 0 && total > kept_bytes {
             break;
         }
         kept += 1;
@@ -1547,7 +1607,14 @@ fn spin(there: impl Fn() -> bool) {
 
 /// How many threads are kept for [`wide`].
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
+            .clamp(1, 16)
+    })
 }
 
 fn workers() -> &'static Workers {
@@ -1672,7 +1739,7 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
 }
 
 /// About this many bytes to a piece of work for [`wide`].
-const WIDE_JOB: usize = 1 << 20;
+const WIDE_JOB: usize = 256 << 10;
 
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
 /// (from, to, bytes), taken by [`take_snapshots`].
@@ -2976,7 +3043,7 @@ pub(crate) fn window_use() -> [u64; 8] {
     let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
+        let pages = (copied.pages.len().saturating_sub(copied.unseen)) as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
         if crate::host::references(&s.buffer) > 1 {
             out[1] += 1;
@@ -3174,10 +3241,10 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(vec![0; pages as usize]),
-            ranged: Mutex::default(),
+            copied: Mutex::new(CopiedState::new(pages as usize)),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            has_pending: std::sync::atomic::AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3290,6 +3357,7 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.has_pending.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3314,6 +3382,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.has_pending.store(true, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -3603,6 +3672,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        self.has_pending.store(!pending.is_empty(), Ordering::Release);
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -3660,12 +3730,15 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.has_pending.load(Ordering::Acquire)
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
+        if !self.has_pending.load(Ordering::Acquire) {
+            return false;
+        }
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
     }
 
@@ -3683,7 +3756,7 @@ impl Shadow {
     pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
-        if from >= to {
+        if from >= to || !self.has_pending.load(Ordering::Acquire) {
             return false;
         }
         let busy: Vec<(usize, usize)> = self
@@ -3703,7 +3776,7 @@ impl Shadow {
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+            Some((_, written)) => !stale_pages_in(base, &copied.pages, a, e, &written).is_empty(),
             None => true,
         })
     }
@@ -3727,7 +3800,7 @@ impl Shadow {
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
-        if from >= to {
+        if from >= to || !self.has_pending.load(Ordering::Acquire) {
             return false;
         }
         let busy: Vec<(usize, usize)> = self
@@ -3764,7 +3837,7 @@ impl Shadow {
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+                stale_pages_in(base, &copied.pages, a, e, &written)
             };
             if stale.is_empty() {
                 continue;
@@ -3839,9 +3912,7 @@ impl Shadow {
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 for page in taken {
-                    if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
-                    }
+                    copied.set(page - base, now);
                 }
             }
             if over.into_inner() {
@@ -3923,14 +3994,17 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        let mut busy: Vec<(usize, usize)> = if self.has_pending.load(Ordering::Acquire) {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect()
+        } else {
+            Vec::new()
+        };
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -3955,6 +4029,11 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        let j = crate::watch::journal_read();
+        self.nothing_new_in(address, len, &j)
+    }
+
+    pub(crate) fn nothing_new_in(&self, address: usize, len: usize, j: &crate::watch::JournalRead) -> bool {
         if self.place.is_some() {
             return true;
         }
@@ -3967,11 +4046,14 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        if self.has_pending.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        {
             return false;
         }
-        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let state = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let ranged = state.ranged_for(from, to);
+        let same = crate::watch::nothing_new_in(j, from, to, start / PAGE, &state.pages, ranged, state.unseen == 0);
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -3979,13 +4061,6 @@ impl Shadow {
             add(C::Unchanged, (to - from) as u64);
         }
         same
-    }
-
-    /// The latest asking after which a range that holds `[from, to)` was
-    /// taken whole (0: none is known). The caller holds `copied`'s lock.
-    fn ranged(&self, from: usize, to: usize) -> u64 {
-        let ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
-        ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -4080,66 +4155,81 @@ impl Shadow {
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut writes = written.iter().peekable();
-        // Pages the range holds in part are never noted in `copied`, and
-        // were copied again at every refresh of the range, written or not:
-        // of the heap's buffer views alone two ends for each of 4,400
-        // copies, every frame. A range that was taken whole, and not written
-        // since, is as it was.
-        let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
-        let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
-        // Pages taken before and written since: in the order of their runs.
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut state = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let ranged = if crate::watch::light() { state.ranged_for(from, to) } else { 0 };
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
         let mut again_at: Vec<(usize, u64)> = Vec::new();
+        let first_page = from / PAGE;
         let last = (to - 1) / PAGE;
-        for page in from / PAGE..=last {
-            let write = match writes.peek() {
-                Some(&&(p, w)) if p == page => {
-                    writes.next();
-                    w
+        if state.unseen == 0 || ranged != 0 {
+            // Fast O(dirty_pages) path: every page in `[from, to)` was taken before,
+            // so only pages present in `written` can possibly satisfy `write > taken`.
+            for &(page, write) in written {
+                if page < first_page || page > last {
+                    continue;
                 }
-                _ => 0,
-            };
-            let at = &mut copied[page - base];
-            let taken = (*at).max(ranged);
-            if taken == 0 || write > taken {
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
-                }
-                // Cut where pages taken before meet pages never taken.
-                let again = taken != 0;
-                if again {
+                let taken = state.pages[page - base].max(ranged);
+                if write > taken {
+                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                        state.set(page - base, now);
+                    }
                     again_at.push((page, taken));
+                    let (a, b) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                    match runs.last_mut() {
+                        Some((_, prev_end, true)) if *prev_end == a => *prev_end = b,
+                        _ => runs.push((a, b, true)),
+                    }
                 }
-                if let Some((first, known)) = run
-                    && known != again
-                {
+            }
+        } else {
+            let mut writes = written.iter().peekable();
+            let mut run = None::<(usize, bool)>;
+            for page in first_page..=last {
+                let write = match writes.peek() {
+                    Some(&&(p, w)) if p == page => {
+                        writes.next();
+                        w
+                    }
+                    _ => 0,
+                };
+                let taken = state.pages[page - base].max(ranged);
+                if taken == 0 || write > taken {
+                    // A page only partly in the range is copied in part: it
+                    // stays stale for the rest.
+                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                        state.set(page - base, now);
+                    }
+                    // Cut where pages taken before meet pages never taken.
+                    let again = taken != 0;
+                    if again {
+                        again_at.push((page, taken));
+                    }
+                    if let Some((first, known)) = run
+                        && known != again
+                    {
+                        runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+                        run = None;
+                    }
+                    run.get_or_insert((page, again));
+                } else if let Some((first, known)) = run.take() {
                     runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
-                    run = None;
                 }
-                run.get_or_insert((page, again));
-            } else if let Some((first, known)) = run.take() {
-                runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+            }
+            // Cut to the range: next to it shaders may be writing the copy.
+            if let Some((first, known)) = run {
+                runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
             }
         }
-        // Cut to the range: next to it shaders may be writing the copy.
-        if let Some((first, known)) = run {
-            runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
+        if crate::watch::light() {
+            state.note_ranged(from, to, now);
+        }
+        drop(state);
+        if runs.is_empty() {
+            return 0;
         }
         let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
-        let bytes = self.take_all(runs);
-        if crate::watch::light() {
-            // All of the range is in the copy as of this asking.
-            let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
-            ranged[0] = (from, to, now);
-            if to - from >= ranged[1].1 - ranged[1].0 {
-                ranged[1] = (from, to, now);
-            }
-        }
-        bytes
+        self.take_all(runs)
     }
 
     /// [`Shadow::take`] of `runs` (from, to, known), on several threads if
@@ -4220,7 +4310,11 @@ impl Shadow {
                 }
                 at = next;
             }
+            if bits.iter().all(|&w| w == 0) {
+                self.landing.store(false, Ordering::Release);
+            }
         }
+        let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
         TITLE.with_borrow_mut(|title| {
             for (from, to, noted) in runs {
                 if !noted {
@@ -4243,13 +4337,20 @@ impl Shadow {
                     } else {
                         ECHO[1].fetch_add((next - at) as u64, Ordering::Relaxed);
                         held.copy_from_slice(title);
-                        self.changed(at - start, next - start);
-                        self.card_changed(at - start, next - start);
+                        let (lo, hi) = (at - start, next - start);
+                        match dirty_runs.last_mut() {
+                            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                            _ => dirty_runs.push((lo, hi)),
+                        }
                     }
                     at = next;
                 }
             }
         });
+        for &(lo, hi) in &dirty_runs {
+            self.changed(lo, hi);
+        }
+        self.card_changed_runs(dirty_runs.into_iter());
         to - from
     }
 
@@ -4793,12 +4894,12 @@ impl Shadow {
             return false;
         };
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(at) = copied.get_mut(page) else {
+        let Some(&at) = copied.pages.get(page) else {
             return false;
         };
-        let held = *at != 0 && *at >= before && crate::watch::block_published(block);
+        let held = at != 0 && at >= before && crate::watch::block_published(block);
         if held {
-            *at = (*at).max(now);
+            copied.max_set(page, now);
         }
         held
     }
@@ -4933,6 +5034,7 @@ mod land_tests {
             return; // no host GPU
         };
         shadow.pending.lock().unwrap().push((title, title + LEN));
+        shadow.has_pending.store(true, Ordering::Release);
         // SAFETY: committed, aligned; touched as atomics or by the landing's
         // stores of whole dwords.
         let dword = |i: usize| unsafe { &*((title + i * 4) as *const AtomicU32) };
@@ -5751,13 +5853,13 @@ mod window_tests {
         assert_eq!(default_card_limits_mb(Some(11229 * MIB)), (16, 2021));
         assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 2048));
 
-        // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
+        // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“15 GiB.
         assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
         assert_eq!(default_card_limits_mb(Some(14 * GIB)), (4, 2048));
         assert_eq!(default_card_limits_mb(Some(15 * GIB)), (4, 2048));
         assert_eq!(default_card_limits_mb(Some(16 * GIB)), (4, 2048));
 
-        // 24–32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
+        // 24ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
         assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));
         assert_eq!(default_card_limits_mb(Some(24 * GIB)), (1, 6144));
         assert_eq!(default_card_limits_mb(Some(32 * GIB)), (1, 8192));

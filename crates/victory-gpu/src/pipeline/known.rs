@@ -54,6 +54,67 @@ struct Book {
 
 static BOOK: OnceLock<Option<Mutex<Book>>> = OnceLock::new();
 
+/// Read-only file-backed view of `known-shaders.bin` so the ~19,000 raw Xbox
+/// shader containers (~189 MB) stay demand-paged from disk instead of pinned
+/// in private heap RAM. Cold/unused shaders never fault into working set.
+struct MappedShaders {
+    mapped: super::library::Mapped,
+    index: HashMap<[u8; 32], (usize, usize)>,
+}
+
+// SAFETY: `MappedShaders` only exposes immutable slices into a read-only
+// `MapViewOfFile` view that lives for the duration of the process.
+unsafe impl Send for MappedShaders {}
+unsafe impl Sync for MappedShaders {}
+
+static MAPPED_SHADERS: OnceLock<Option<MappedShaders>> = OnceLock::new();
+
+fn mapped_shaders() -> Option<&'static MappedShaders> {
+    MAPPED_SHADERS
+        .get_or_init(|| {
+            let dir = super::library::folder()?;
+            let path = dir.join(SHADERS);
+            let mapped = super::library::Mapped::open_holding(&path, true)?;
+            let data = mapped.bytes();
+            let mut index = HashMap::new();
+            let mut at = 0usize;
+            while at + 37 <= data.len() {
+                let size = u32::from_le_bytes([
+                    data[at + 33],
+                    data[at + 34],
+                    data[at + 35],
+                    data[at + 36],
+                ]) as usize;
+                let end = at + 37 + size;
+                if end > data.len() {
+                    break;
+                }
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&data[at + 1..at + 33]);
+                index.entry(hash).or_insert((at + 37, size));
+                at = end;
+            }
+            if index.is_empty() {
+                return None;
+            }
+            tracing::info!(
+                shaders = index.len(),
+                bytes = data.len(),
+                "known-shaders.bin memory-mapped read-only (demand-paged from disk)"
+            );
+            Some(MappedShaders { mapped, index })
+        })
+        .as_ref()
+}
+
+/// Returns a `'static` slice into the read-only memory-mapped `known-shaders.bin`
+/// for `hash`, avoiding a heap copy in private RAM.
+pub(super) fn mapped_container(hash: &[u8; 32]) -> Option<&'static [u8]> {
+    let ms = mapped_shaders()?;
+    let &(offset, size) = ms.index.get(hash)?;
+    ms.mapped.bytes().get(offset..offset + size)
+}
+
 fn book() -> Option<&'static Mutex<Book>> {
     BOOK.get_or_init(|| {
         let dir = super::library::folder().filter(|_| on())?;
@@ -110,7 +171,7 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
             new.push(stage);
             new.extend(hash);
             new.extend((s.container.len() as u32).to_le_bytes());
-            new.extend(&s.container);
+            new.extend(&*s.container);
         }
     }
     entry.push(u8::from(graphics.is_some()));

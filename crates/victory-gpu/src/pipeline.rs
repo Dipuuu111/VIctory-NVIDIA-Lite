@@ -54,13 +54,39 @@ pub(crate) struct ComputeHead {
     stage: Bytecode,
 }
 
+/// Raw Xbox shader container bytes: either demand-paged from read-only
+/// memory-mapped `known-shaders.bin` (0 bytes of private heap RAM) or
+/// heap-owned for shaders not yet in `known-shaders.bin`.
+enum ContainerBytes {
+    Owned(Vec<u8>),
+    #[cfg(windows)]
+    Mapped(&'static [u8]),
+}
+
+impl AsRef<[u8]> for ContainerBytes {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl std::ops::Deref for ContainerBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(v) => v,
+            #[cfg(windows)]
+            Self::Mapped(s) => s,
+        }
+    }
+}
+
 /// A shader container a title passed, shared by every pipeline with the
 /// same bytes.
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
-    container: Vec<u8>,
+    container: ContainerBytes,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
@@ -109,11 +135,22 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .entry(*full.as_bytes())
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(windows)]
+            let container = if let Some(mapped) = known::mapped_container(full.as_bytes()) {
+                ContainerBytes::Mapped(mapped)
+            } else {
+                KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                ContainerBytes::Owned(bytes.to_vec())
+            };
+            #[cfg(not(windows))]
+            let container = {
+                KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                ContainerBytes::Owned(bytes.to_vec())
+            };
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
+                container,
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
@@ -817,7 +854,7 @@ mod tests {
         pipeline(p)
             .shaders
             .iter()
-            .map(|s| (s.stage, s.container.clone()))
+            .map(|s| (s.stage, s.container.to_vec()))
             .collect()
     }
 

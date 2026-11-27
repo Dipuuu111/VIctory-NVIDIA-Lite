@@ -134,7 +134,13 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if level() < if window { 1 } else { 2 } {
+    let want = match level() {
+        1 => window,
+        2 => true,
+        3 => !window,
+        _ => false,
+    };
+    if !want {
         return None;
     }
     // View memory: known from the runtime without asking Windows.

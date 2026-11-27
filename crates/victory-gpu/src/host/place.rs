@@ -189,7 +189,7 @@ unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
 /// The host copy of `[src, src + len)` if shaders write it: what it holds at
 /// a place in a list is not what title memory holds at submission.
 fn shaders_own(src: usize, len: usize) -> Option<std::sync::Arc<Shadow>> {
-    crate::shadow::peek(src as u64, len as u64).filter(|s| s.written() && !s.in_place())
+    crate::shadow::peek(src as u64, len as u64).filter(|s| s.written() || s.in_place())
 }
 
 impl HostList {
@@ -202,7 +202,7 @@ impl HostList {
         let Some(host) = host() else {
             return false;
         };
-        let Some(to) = crate::shadow::peek(dst as u64, len as u64).filter(|s| !s.in_place()) else {
+        let Some(to) = crate::shadow::peek(dst as u64, len as u64) else {
             return false;
         };
         let own = shaders_own(src, len);

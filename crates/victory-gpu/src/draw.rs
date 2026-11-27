@@ -723,13 +723,23 @@ struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
 pub(crate) struct BufferSweep {
     passes: u64,
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
+    /// Per-part (`slot % HEAP_ROUND`) reduced shadow spans and view counts so
+    /// each pass only rescans the touched part(s) instead of all 83,000+ slots.
+    part_spans: [crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>; HEAP_ROUND as usize],
+    part_views: [u32; HEAP_ROUND as usize],
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
 }
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+        Self {
+            passes: 0,
+            ranges: HeapRanges(Vec::new()),
+            part_spans: std::array::from_fn(|_| Default::default()),
+            part_views: [0; HEAP_ROUND as usize],
+            unwatched: Default::default(),
+        }
     }
 }
 
@@ -839,7 +849,7 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
-const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+const RECHECK_FRAMES: [u64; 2] = [4, 40];
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -1170,18 +1180,25 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let BufferSweep { passes, ranges, unwatched } = &mut *kept;
+    let BufferSweep { passes, ranges, part_spans, part_views, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
+    let mut dirty_parts: u16 = 0;
     let slots = if all {
         ranges.0.clear();
+        dirty_parts = u16::MAX;
         host.buffer_slots()
     } else if heap_spread() {
-        // The written ones, and this pass's part of the others.
+        // The written ones, and this pass's part of the others (deduplicated).
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
         ranges.forget_part(part, parts);
+        dirty_parts |= 1u16 << part;
         let mut slots = host.buffer_slots_of(part, parts);
-        slots.extend(changed);
+        if !changed.is_empty() {
+            slots.extend(changed);
+            slots.sort_unstable();
+            slots.dedup();
+        }
         slots
     } else {
         changed
@@ -1250,21 +1267,40 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             range
         });
         ranges.set(index, range);
+        dirty_parts |= 1u16 << (index as usize % HEAP_ROUND as usize);
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
-    // Per host copy, the span its picked views cover.
+    // Recompute cached per-part spans only for the part(s) touched this pass.
+    let stride = HEAP_ROUND as usize;
+    for part in 0..stride {
+        if (dirty_parts & (1u16 << part)) != 0 {
+            let ps = &mut part_spans[part];
+            ps.clear();
+            let mut pv = 0u32;
+            for entry in ranges.0.iter().skip(part).step_by(stride).flatten() {
+                let (shadow, from, to) = entry;
+                pv += 1;
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let span = ps.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
+            part_views[part] = pv;
+        }
+    }
+    // Merge the 16 small per-part span maps instead of scanning all 83,000+ slots.
     let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
-    let mut views = 0u32;
-    for (shadow, from, to) in ranges.ranges() {
-        views += 1;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-        span.1 = span.1.min(*from);
-        span.2 = span.2.max(*to);
+    let views: u32 = part_views.iter().copied().sum();
+    for ps in part_spans.iter() {
+        for (&key, (shadow, from, to)) in ps {
+            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+            span.1 = span.1.min(*from);
+            span.2 = span.2.max(*to);
+        }
     }
     let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.
@@ -3913,19 +3949,20 @@ impl State {
             Role::Miss => usual_depth(MISS_DEPTH)
                 .filter(|(d, _)| {
                     image.as_ref().is_some_and(|(i, _)| {
-                        d.Width.abs_diff(i.Width * 2) <= 1 && u64::from(d.Height).abs_diff(u64::from(i.Height) * 2) <= 1
+                        (d.Width.abs_diff(i.Width * 2) <= 1 && u64::from(d.Height).abs_diff(u64::from(i.Height) * 2) <= 1)
+                            || (d.Width == i.Width && d.Height == i.Height)
                     })
                 })
                 .or_else(|| {
                 let half = image.as_ref().map(|(d, _)| (d.Width, d.Height));
-                // The picture's depth: twice the rays' image each way (run
-                // final-4: a looser match took another depth texture, which the
-                // size check then refused, "another image").
+                // The picture's depth: prefer full-res (2x the rays' image), and
+                // fall back to half-res R32_FLOAT (1x, e.g. Series S Srv(1, 96) 640x360 f41)
+                // when CS_RayMiss binds only the half-res depth buffer.
+                use windows::Win32::Graphics::Dxgi::Common::{
+                    DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT,
+                    DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+                };
                 scan(ResourceType::Srv, &|d| {
-                    use windows::Win32::Graphics::Dxgi::Common::{
-                        DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_TYPELESS,
-                        DXGI_FORMAT_R32G8X24_TYPELESS,
-                    };
                     depth_like(d)
                         && matches!(
                             d.Format,
@@ -3937,6 +3974,20 @@ impl State {
                         && half.is_some_and(|(w, h)| {
                             d.Width.abs_diff(w * 2) <= 1 && u64::from(d.Height).abs_diff(u64::from(h) * 2) <= 1
                         })
+                })
+                .or_else(|| {
+                    scan(ResourceType::Srv, &|d| {
+                        d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                            && matches!(
+                                d.Format,
+                                DXGI_FORMAT_R32_FLOAT
+                                    | DXGI_FORMAT_R32_TYPELESS
+                                    | DXGI_FORMAT_D32_FLOAT
+                                    | DXGI_FORMAT_R32G8X24_TYPELESS
+                                    | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                            )
+                            && half.is_some_and(|(w, h)| d.Width == w && d.Height == h)
+                    })
                 })
             }),
             Role::Radiance | Role::Air => image,
