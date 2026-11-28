@@ -43,7 +43,7 @@ pub(crate) fn on() -> bool {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_AHEAD").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_AHEAD").is_none_or(|v| v != "0"))
 }
 
 /// An upload on its way.

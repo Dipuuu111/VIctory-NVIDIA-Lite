@@ -711,6 +711,13 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let mut out = Vec::new();
+    let now = writes_into(start, end, guarded, &mut out)?;
+    Some((now, out))
+}
+
+/// Like [`writes`], reusing `out` to avoid per-refresh heap allocations.
+pub(crate) fn writes_into(start: usize, end: usize, guarded: bool, out: &mut Vec<(usize, u64)>) -> Option<u64> {
     // Guarding asks Windows about the pages and protects them: a lazy view
     // is none to it yet. (Not so a view in the books alone, which is
     // guarded there: [`use_soft_views`].)
@@ -718,11 +725,21 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         materialize(start, end.saturating_sub(start));
     }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
+    let fill = |j: &Journal, out: &mut Vec<(usize, u64)>| {
+        out.clear();
+        out.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+    };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| Journal::covers_ahead(&j.ahead, first, last).then(|| (j.ahead_asked, of(j)));
-    if let Some(known) = ahead(&journal()) {
-        return Some(known);
+    let ahead = |j: &Journal, out: &mut Vec<(usize, u64)>| {
+        if Journal::covers_ahead(&j.ahead, first, last) {
+            fill(j, out);
+            Some(j.ahead_asked)
+        } else {
+            None
+        }
+    };
+    if let Some(now) = ahead(&journal(), out) {
+        return Some(now);
     }
     // Read-only since an asking noted it: the bits first, then the journal.
     if guarded && published(start, end) {
@@ -732,13 +749,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             crate::faultbook::note(crate::faultbook::What::Known, first, last, 0);
         }
         let j = journal();
-        return Some((next_asking(), of(&j)));
+        fill(&j, out);
+        return Some(next_asking());
     }
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
     let _range = Asking::hold(first, last);
-    if let Some(known) = ahead(&journal()) {
-        return Some(known);
+    if let Some(now) = ahead(&journal(), out) {
+        return Some(now);
     }
     let mut guards_asked = false;
     // (View memory read-only by our hand: the kernel would refuse.)
@@ -770,15 +788,17 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if pages.is_empty() {
         // Nothing to note: the others may go on reading.
         let j = journal();
-        return Some((next_asking(), of(&j)));
+        fill(&j, out);
+        return Some(next_asking());
     }
-    let answer = {
+    let now = {
         let mut j = journal_mut();
         let now = next_asking();
         for &(page, parts) in &pages {
             j.note(page, parts, now);
         }
-        (now, of(&j))
+        fill(&j, out);
+        now
     };
     // Noted: what the guards made clean of it is known by its bits from
     // now on. (The range is still held: no other asking of any of it came
@@ -786,7 +806,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if guards_asked && light() {
         publish(&pages.iter().map(|p| p.0).collect::<Vec<_>>());
     }
-    Some(answer)
+    Some(now)
 }
 
 /// Whether nothing of `[start, end)` was written that a copy with the notes

@@ -1397,7 +1397,12 @@ fn pooled(n: usize) -> Vec<u8> {
 /// [`Shadow::writing`]), and the page faults of filling it.
 fn snapshots_kept() -> usize {
     static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| std::env::var("VICTORY_SNAPSHOT_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024))
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| if crate::residency::limited_host_ram() { 256 } else { 1024 })
+    })
 }
 
 /// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
@@ -1410,7 +1415,7 @@ fn snapshots_kept_bytes() -> usize {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .map(|mb| mb << 20)
-            .unwrap_or(512 << 20)
+            .unwrap_or_else(|| if crate::residency::limited_host_ram() { 128 << 20 } else { 512 << 20 })
     })
 }
 
@@ -4069,11 +4074,26 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            thread_local! {
+                static WRITTEN: std::cell::RefCell<Vec<(usize, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+            // Take the scratch Vec out before calling `writes_into`/`copy_stale`
+            // because `copy_stale -> take_all -> wide` can re-enter `update_free`
+            // on the same worker thread.
+            let mut written = WRITTEN.with(|buf| buf.take());
+            let copied = crate::watch::writes_into(from, to, true, &mut written).map(|now| {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                self.copy_stale(from, to, now, &written)
+            });
+            WRITTEN.with(|buf| {
+                let mut slot = buf.borrow_mut();
+                if written.capacity() > slot.capacity() {
+                    *slot = written;
+                }
+            });
+            if let Some(copied) = copied {
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -4230,7 +4250,11 @@ impl Shadow {
         if runs.is_empty() {
             return 0;
         }
-        let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
+        let runs = if again_at.is_empty() {
+            runs
+        } else {
+            by_parts(runs, &again_at, &crate::watch::parts_written(&again_at))
+        };
         self.take_all(runs)
     }
 

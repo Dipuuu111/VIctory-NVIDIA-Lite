@@ -659,7 +659,7 @@ fn sync_in_place() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_IN_PLACE").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_IN_PLACE").is_none_or(|v| v != "0"))
 }
 
 /// Of those mirrored, since the last frame line: no view, a view of an object,
@@ -714,7 +714,7 @@ fn sync_jobs() -> (usize, usize) {
         return if fine { (SYNC_PAGES_FINE, SYNC_AT_A_TIME_FINE) } else { (SYNC_PAGES, SYNC_AT_A_TIME) };
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_FINE").is_some_and(|v| v != "0")) {
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_FINE").is_none_or(|v| v != "0")) {
         (SYNC_PAGES_FINE, SYNC_AT_A_TIME_FINE)
     } else {
         (SYNC_PAGES, SYNC_AT_A_TIME)

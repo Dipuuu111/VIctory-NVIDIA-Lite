@@ -86,6 +86,8 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    #[cfg(windows)]
+    key: [u8; 32],
     container: ContainerBytes,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
@@ -150,6 +152,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                #[cfg(windows)]
+                key: *full.as_bytes(),
                 container,
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
@@ -178,6 +182,67 @@ pub(crate) struct Translated {
     pub(crate) picks: std::sync::atomic::AtomicU8,
 }
 
+/// Bounded FIFO cache of translated host DXIL bytecodes so `Translated` does
+/// not permanently pin hundreds of megabytes of post-compile bytecode in RAM.
+/// Evicted entries are transparently reloaded from the disk shader cache on
+/// rare subsequent PSO creation sharing the same shader.
+#[cfg(windows)]
+struct DxilCache {
+    entries: HashMap<[u8; 32], Arc<[u8]>>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    bytes: usize,
+    cap: usize,
+}
+
+#[cfg(windows)]
+impl DxilCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+            cap,
+        }
+    }
+
+    fn get(&self, key: &[u8; 32]) -> Option<Arc<[u8]>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: [u8; 32], dxil: Arc<[u8]>) -> Arc<[u8]> {
+        if let Some(existing) = self.entries.get(&key) {
+            return existing.clone();
+        }
+        let len = dxil.len();
+        while self.bytes + len > self.cap {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(removed.len());
+            }
+        }
+        self.entries.insert(key, dxil.clone());
+        self.order.push_back(key);
+        self.bytes += len;
+        KEPT[3].store(self.bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        dxil
+    }
+}
+
+#[cfg(windows)]
+fn dxil_cache() -> &'static Mutex<DxilCache> {
+    static CACHE: OnceLock<Mutex<DxilCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let cap = std::env::var("VICTORY_DXIL_CACHE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|mb| mb << 20)
+            .unwrap_or_else(|| if crate::residency::limited_host_ram() { 16 << 20 } else { 64 << 20 });
+        Mutex::new(DxilCache::new(cap))
+    })
+}
+
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not
@@ -185,7 +250,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let mut done = translate(&self.container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -197,9 +262,10 @@ impl Shader {
                         let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
                     }
                 }
-                if let Ok(t) = &done {
+                if let Ok(t) = &mut done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let dxil = std::mem::take(&mut t.host.dxil);
+                    dxil_cache().lock().unwrap_or_else(|e| e.into_inner()).insert(self.key, Arc::from(dxil));
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -219,6 +285,17 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+
+    /// Host DXIL bytecode for PSO creation: served from the bounded RAM cache
+    /// on burst reuse, or reloaded from the disk shader cache on eviction.
+    pub(crate) fn dxil(&self) -> Option<Arc<[u8]>> {
+        self.translated()?;
+        if let Some(hit) = dxil_cache().lock().unwrap_or_else(|e| e.into_inner()).get(&self.key) {
+            return Some(hit);
+        }
+        let host = crate::shader_cache::host_shader(&self.container).ok()?;
+        Some(dxil_cache().lock().unwrap_or_else(|e| e.into_inner()).insert(self.key, Arc::from(host.dxil)))
     }
 }
 
@@ -952,5 +1029,25 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dxil_cache_evicts_oldest_within_cap() {
+        let mut cache = DxilCache::new(10);
+        let k1 = [1u8; 32];
+        let k2 = [2u8; 32];
+        let k3 = [3u8; 32];
+        cache.insert(k1, Arc::from(vec![1u8; 4]));
+        cache.insert(k2, Arc::from(vec![2u8; 6]));
+        assert_eq!(cache.bytes, 10);
+        assert!(cache.get(&k1).is_some());
+        assert!(cache.get(&k2).is_some());
+        // Inserting 5 bytes evicts k1 (4 bytes -> 6 left), still 6+5>10, so evicts k2 too.
+        cache.insert(k3, Arc::from(vec![3u8; 5]));
+        assert_eq!(cache.bytes, 5);
+        assert!(cache.get(&k1).is_none());
+        assert!(cache.get(&k2).is_none());
+        assert_eq!(cache.get(&k3).as_deref(), Some(&[3u8; 5][..]));
     }
 }

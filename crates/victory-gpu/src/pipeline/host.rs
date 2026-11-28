@@ -602,12 +602,13 @@ impl HostPipeline {
         // Not from the library if it has static samplers (their places in the
         // driver's table differ between runs: `library::with_static_samplers`).
         let _samplers = super::library::with_static_samplers(!samplers.is_empty());
+        let dxils: Vec<Option<std::sync::Arc<[u8]>>> = stages.iter().map(|(s, _)| s.dxil()).collect();
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
+            dxils.get(i).and_then(|d| d.as_ref()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
+                |b| D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: b.as_ptr().cast(),
+                    BytecodeLength: b.len(),
                 },
             )
         };
@@ -709,9 +710,9 @@ impl HostPipeline {
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
         if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
-            let vs = &stages[0].0.translated()?.host.dxil;
-            match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
+            let vs = dxils.first().and_then(|d| d.as_deref())?;
+            let ps = dxils.get(1).and_then(|d| d.as_deref());
+            match victory_shader::emit::rect_list_gs(vs, ps) {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }

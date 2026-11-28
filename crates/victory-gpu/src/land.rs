@@ -63,10 +63,10 @@ fn beside_on() -> bool {
 }
 
 /// Whether pieces an earlier fetch holds as they are now are left out
-/// ([`Had`]; `VICTORY_LAND_SKIP=1`, off by default: counted either way).
+/// ([`Had`]; on by default, `VICTORY_LAND_SKIP=0` disables).
 pub(crate) fn skip_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_SKIP").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_SKIP").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line; microseconds first.
