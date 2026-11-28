@@ -5,6 +5,8 @@ A performance and memory-optimization fork of **VIctory-NVIDIA**, engineered to 
 > **Notice:** This repository contains source code for the compatibility layer only. It contains **no** game files, shaders, keys, or copyrighted assets. You must supply your own legal dump of the title.
 
 ---
+> **Currently many people arent able to boot into the game looks like a rust compilation error, ill check and push a fix update soon**
+---
 
 ## Why This Fork Exists
 
