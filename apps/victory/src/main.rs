@@ -3,6 +3,35 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+/// DirectX 12 Agility SDK exports for Windows 10 compatibility.
+///
+/// Windows 10's inbox D3D12 runtime caps at Shader Model 6.5 and refuses
+/// bindless root signature flags (`0xc00`/`0xc01`), crashing during init.
+/// Exporting `D3D12SDKVersion` and `D3D12SDKPath` lets Windows 10 load an
+/// app-local `D3D12\D3D12Core.dll` (`Microsoft.Direct3D.D3D12` 1.610.x) placed
+/// next to `victory.exe`. Windows 11 builds whose inbox runtime is version 610
+/// or newer continue using the OS runtime automatically with no extra DLL.
+#[cfg(windows)]
+mod agility_sdk {
+    use core::ffi::c_char;
+
+    #[repr(transparent)]
+    pub struct SdkPath(*const c_char);
+
+    // SAFETY: points to a `'static` null-terminated ASCII path literal.
+    unsafe impl Sync for SdkPath {}
+
+    #[allow(non_upper_case_globals)]
+    #[unsafe(no_mangle)]
+    #[used]
+    pub static D3D12SDKVersion: u32 = 610;
+
+    #[allow(non_upper_case_globals)]
+    #[unsafe(no_mangle)]
+    #[used]
+    pub static D3D12SDKPath: SdkPath = SdkPath(c".\\D3D12\\".as_ptr());
+}
+
 mod census;
 mod inspect;
 #[cfg(windows)]

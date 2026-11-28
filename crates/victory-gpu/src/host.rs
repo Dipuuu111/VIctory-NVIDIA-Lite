@@ -906,16 +906,52 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
+        let created = if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            tracing::info!("host device on the software adapter (WARP)");
+            let res = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device);
+            if res.is_ok() {
+                tracing::info!("host device on the software adapter (WARP)");
+            }
+            res
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            // Whether a GPU hang ends the run or freezes the PC (#1054).
-            crate::tdr::log();
+            let res = D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device);
+            if res.is_ok() {
+                // Whether a GPU hang ends the run or freezes the PC (#1054).
+                crate::tdr::log();
+            }
+            res
+        };
+        if let Err(err) = created {
+            // DXGI_ERROR_SDK_COMPONENT_MISSING (0x887E0003)
+            if err.code().0 == 0x887E_0003_u32 as i32 {
+                tracing::error!(
+                    "D3D12 Agility SDK missing (0x887E0003): on Windows 10 (or older Windows 11 builds), \
+                     download NuGet package Microsoft.Direct3D.D3D12 1.610.5 and place \
+                     build\\native\\bin\\x64\\D3D12Core.dll at D3D12\\D3D12Core.dll next to victory.exe"
+                );
+            }
+            return Err(err);
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+            .is_ok()
+            && sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0
+        {
+            tracing::error!(
+                highest_shader_model = format_args!("{:#x}", sm.HighestShaderModel.0),
+                "host D3D12 runtime is below Shader Model 6.6 (root signatures 0xc00/0xc01 will fail): \
+                 on Windows 10, place Microsoft.Direct3D.D3D12 1.610.5's x64 D3D12Core.dll at \
+                 D3D12\\D3D12Core.dll next to victory.exe (or run on Windows 11)"
+            );
+        }
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
@@ -2256,7 +2292,7 @@ unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &crate::shadow::Card
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -3928,7 +3964,7 @@ mod late_tests {
 /// only the copy that held it did.
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, and those

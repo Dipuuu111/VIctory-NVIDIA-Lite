@@ -4,8 +4,9 @@ A performance and memory-optimization fork of **VIctory-NVIDIA**, engineered to 
 
 > **Notice:** This repository contains source code for the compatibility layer only. It contains **no** game files, shaders, keys, or copyrighted assets. You must supply your own legal dump of the title.
 
----
-> **Currently many people arent able to boot into the game looks like a rust compilation error, ill check and push a fix update soon**
+> **Windows 10 Startup Crash Fix (Root Signature `0xc00` / `0xc01` / `0x80070057`):**
+> Windows 10's built-in D3D12 runtime stops at **Shader Model 6.5**, so Shader Model 6.6 bindless root signatures (`0xc00`/`0xc01`) are rejected on boot and the title crashes during initialization. `victory.exe` now enables the **DirectX 12 Agility SDK (`D3D12SDKVersion = 610`)** — Windows 10 users just need to place `D3D12Core.dll` beside `victory.exe` (see **[Windows 10 Setup (DirectX 12 Agility SDK)](#windows-10-setup-directx-12-agility-sdk)** below). Windows 11 (23H2/24H2+) works out of the box with no extra DLL.
+
 ---
 
 ## Why This Fork Exists
@@ -55,9 +56,26 @@ Upstream builds are primarily tuned for desktop workstations with 32–64 GB of 
 ## Building from Source
 
 ### Requirements
-- Windows 10 or 11 (x64)
+- **Windows 11 (x64, 23H2/24H2+ recommended)** — Shader Model 6.6 is built into the OS; no extra D3D12 DLL required
+- **Windows 10 (x64, 22H2 / build 19045+)** — supported via the **DirectX 12 Agility SDK** (see setup steps below)
 - NVIDIA GeForce RTX GPU with recent drivers (8 GB VRAM supported; 16 GB+ system RAM recommended, SSD strongly recommended)
 - [Rust](https://rustup.rs) toolchain and [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (*Desktop development with C++*)
+
+### Windows 10 Setup (DirectX 12 Agility SDK)
+If you are on **Windows 10** and see a crash on boot with `root signature: Unsupported bit-flag set (root signature flags c01)` / `E_INVALIDARG (0x80070057)` or `DXGI_ERROR_SDK_COMPONENT_MISSING (0x887E0003)`:
+
+1. Download **[Microsoft.Direct3D.D3D12 1.610.5](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.610.5)** from NuGet (click **Download package** on the right side to save the `.nupkg` file).
+   - *Important:* The DLL version **must** match `1.610.x` (`D3D12SDKVersion = 610`). Using a different major Agility SDK version (e.g. `1.614` or `1.620`) will not match `victory.exe`'s exported version.
+2. Rename the downloaded `.nupkg` file extension to `.zip` and extract it.
+3. Create a folder named `D3D12` in the **same folder as `victory.exe`**.
+4. Copy `build\native\bin\x64\D3D12Core.dll` from the extracted archive into `D3D12\D3D12Core.dll`:
+   ```text
+   <your-folder>\
+   ├── victory.exe
+   └── D3D12\
+       └── D3D12Core.dll
+   ```
+5. Ensure Windows 10 is updated to **22H2 (build 19045)** or newer and your NVIDIA GPU drivers are up to date, then launch `victory.exe` normally. (Alternatively, upgrading to Windows 11 23H2/24H2+ removes the need for `D3D12\D3D12Core.dll` altogether.)
 
 ### Build Commands
 ```powershell
